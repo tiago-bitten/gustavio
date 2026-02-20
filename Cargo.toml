@@ -1,0 +1,12 @@
+[package]
+name = "gustavio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+local-ip-address = "0.6"
