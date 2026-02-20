@@ -2,7 +2,7 @@ use crate::app_event::AppEvent;
 use crate::db::{Database, MessageRow};
 use crate::ipc::js_call;
 use crate::protocol::TcpMessage;
-use crate::state::SharedState;
+use crate::state::{SharedState, SharedWriter};
 
 use std::sync::Arc;
 use tao::event_loop::EventLoopProxy;
@@ -64,17 +64,33 @@ async fn handle_connection(
     let mut hello_json = serde_json::to_string(&hello).unwrap();
     hello_json.push('\n');
 
-    let wr = Arc::new(tokio::sync::Mutex::new(wr));
+    let writer: SharedWriter = Arc::new(TokioMutex::new(wr));
     {
-        let mut w = wr.lock().await;
+        let mut w = writer.lock().await;
         if w.write_all(hello_json.as_bytes()).await.is_err() {
             return;
         }
     }
 
-    let mut remote_peer_id = String::new();
-    let mut line = String::new();
+    // Read first message — must be Hello
+    let mut first_line = String::new();
+    match reader.read_line(&mut first_line).await {
+        Ok(0) | Err(_) => return,
+        Ok(_) => {}
+    }
+    let remote_peer_id = match serde_json::from_str::<TcpMessage>(first_line.trim()) {
+        Ok(TcpMessage::Hello { peer_id, .. }) => peer_id,
+        _ => return,
+    };
 
+    // Always register — newest connection wins (replaces dead ones too)
+    {
+        let mut conns = state.connections.lock().await;
+        conns.insert(remote_peer_id.clone(), writer.clone());
+    }
+
+    // Read loop
+    let mut line = String::new();
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
@@ -87,145 +103,24 @@ async fn handle_connection(
                 let Ok(msg) = serde_json::from_str::<TcpMessage>(trimmed) else {
                     continue;
                 };
-                match msg {
-                    TcpMessage::Hello {
-                        peer_id,
-                        username: _,
-                    } => {
-                        remote_peer_id = peer_id.clone();
-                        // Store the write half for sending messages later
-                        // We clone the Arc, but we need to move the actual writer
-                        // This is handled by registering in connections
-                    }
-                    TcpMessage::DirectMessage {
-                        ref id,
-                        ref from_id,
-                        ref from_name,
-                        ref content,
-                        ref timestamp,
-                    } => {
-                        // Save to DB
-                        let row = MessageRow {
-                            id: id.clone(),
-                            conversation_id: from_id.clone(),
-                            from_id: from_id.clone(),
-                            from_name: from_name.clone(),
-                            content: content.clone(),
-                            timestamp: timestamp.clone(),
-                            is_group: false,
-                            status: "delivered".into(),
-                        };
-                        {
-                            let d = db.lock().await;
-                            let _ = d.insert_message(&row);
-                        }
-                        // Push to UI
-                        let js = js_call("incoming_message", &row);
-                        let _ = proxy.send_event(AppEvent::EvalScript(js));
-                        // Send ack
-                        let ack = TcpMessage::Ack {
-                            message_id: id.clone(),
-                            status: "delivered".into(),
-                        };
-                        let mut ack_json = serde_json::to_string(&ack).unwrap();
-                        ack_json.push('\n');
-                        let mut w = wr.lock().await;
-                        let _ = w.write_all(ack_json.as_bytes()).await;
-                    }
-                    TcpMessage::GroupMessage {
-                        ref id,
-                        ref group_id,
-                        ref from_id,
-                        ref from_name,
-                        ref content,
-                        ref timestamp,
-                    } => {
-                        let row = MessageRow {
-                            id: id.clone(),
-                            conversation_id: group_id.clone(),
-                            from_id: from_id.clone(),
-                            from_name: from_name.clone(),
-                            content: content.clone(),
-                            timestamp: timestamp.clone(),
-                            is_group: true,
-                            status: "delivered".into(),
-                        };
-                        {
-                            let d = db.lock().await;
-                            let _ = d.insert_message(&row);
-                        }
-                        let js = js_call("incoming_message", &row);
-                        let _ = proxy.send_event(AppEvent::EvalScript(js));
-                    }
-                    TcpMessage::Ack {
-                        ref message_id,
-                        ref status,
-                    } => {
-                        {
-                            let d = db.lock().await;
-                            let _ = d.update_message_status(message_id, status);
-                        }
-                        #[derive(serde::Serialize)]
-                        struct AckInfo {
-                            message_id: String,
-                            status: String,
-                        }
-                        let js = js_call(
-                            "message_ack",
-                            &AckInfo {
-                                message_id: message_id.clone(),
-                                status: status.clone(),
-                            },
-                        );
-                        let _ = proxy.send_event(AppEvent::EvalScript(js));
-                    }
-                    TcpMessage::GroupCreate {
-                        ref group_id,
-                        ref name,
-                        ref creator_id,
-                        ref members,
-                    } => {
-                        let d = db.lock().await;
-                        let _ = d.create_group(group_id, name, creator_id);
-                        for m in members {
-                            let _ = d.add_group_member(group_id, m);
-                        }
-                        drop(d);
-                        // Refresh groups in UI
-                        let d = db.lock().await;
-                        let groups = d.get_groups();
-                        drop(d);
-                        let js = js_call("group_list", &groups);
-                        let _ = proxy.send_event(AppEvent::EvalScript(js));
-                    }
-                    TcpMessage::GroupMemberAdd {
-                        ref group_id,
-                        ref peer_id,
-                    } => {
-                        let d = db.lock().await;
-                        let _ = d.add_group_member(group_id, peer_id);
-                    }
-                    TcpMessage::GroupMemberRemove {
-                        ref group_id,
-                        ref peer_id,
-                    } => {
-                        let d = db.lock().await;
-                        let _ = d.remove_group_member(group_id, peer_id);
-                    }
-                }
+                process_incoming(&msg, &writer, &db, &proxy).await;
             }
         }
     }
 
-    // Connection closed — remove from connections
-    if !remote_peer_id.is_empty() {
+    // Connection closed — remove only if it's still OUR writer
+    {
         let mut conns = state.connections.lock().await;
-        conns.remove(&remote_peer_id);
+        if let Some(existing) = conns.get(&remote_peer_id) {
+            if Arc::ptr_eq(existing, &writer) {
+                conns.remove(&remote_peer_id);
+            }
+        }
     }
 }
 
-/// Connect to a peer's TCP server and return the write half.
-/// Also spawns a reader task for incoming messages on this connection.
+/// Connect to a peer's TCP server.
+/// Stores the writer in state.connections and spawns a reader task.
 pub async fn connect_to_peer(
     peer_ip: &str,
     peer_tcp_port: u16,
@@ -234,9 +129,12 @@ pub async fn connect_to_peer(
     state: Arc<SharedState>,
     db: Arc<TokioMutex<Database>>,
     proxy: EventLoopProxy<AppEvent>,
-) -> Option<()> {
+) -> Result<(), String> {
     let addr = format!("{peer_ip}:{peer_tcp_port}");
-    let stream = TcpStream::connect(&addr).await.ok()?;
+    let stream = TcpStream::connect(&addr)
+        .await
+        .map_err(|e| format!("TCP connect to {addr}: {e}"))?;
+
     let (rd, wr) = stream.into_split();
 
     // Send Hello
@@ -247,32 +145,36 @@ pub async fn connect_to_peer(
     let mut hello_json = serde_json::to_string(&hello).unwrap();
     hello_json.push('\n');
 
-    let wr = tokio::sync::Mutex::new(wr);
+    let writer: SharedWriter = Arc::new(TokioMutex::new(wr));
     {
-        let mut w = wr.lock().await;
-        w.write_all(hello_json.as_bytes()).await.ok()?;
+        let mut w = writer.lock().await;
+        w.write_all(hello_json.as_bytes())
+            .await
+            .map_err(|e| format!("Send hello: {e}"))?;
     }
 
-    // We need to figure out the peer_id from the Hello response
+    // Read Hello response
     let mut reader = BufReader::new(rd);
     let mut first_line = String::new();
-    reader.read_line(&mut first_line).await.ok()?;
-    let hello_resp: TcpMessage = serde_json::from_str(first_line.trim()).ok()?;
-    let remote_peer_id = match &hello_resp {
-        TcpMessage::Hello { peer_id, .. } => peer_id.clone(),
-        _ => return None,
+    reader
+        .read_line(&mut first_line)
+        .await
+        .map_err(|e| format!("Read hello: {e}"))?;
+    let remote_peer_id = match serde_json::from_str::<TcpMessage>(first_line.trim()) {
+        Ok(TcpMessage::Hello { peer_id, .. }) => peer_id,
+        _ => return Err("Bad hello response".into()),
     };
 
-    // Store the writer in connections
-    let wr = wr.into_inner();
+    // Store the writer — always overwrite (freshest connection)
     {
         let mut conns = state.connections.lock().await;
-        conns.insert(remote_peer_id.clone(), wr);
+        conns.insert(remote_peer_id.clone(), writer.clone());
     }
 
-    // Spawn a reader for this connection
+    // Spawn reader task
     let st = state.clone();
     let rpid = remote_peer_id.clone();
+    let wr_clone = writer.clone();
     tokio::spawn(async move {
         let mut line = String::new();
         loop {
@@ -287,123 +189,178 @@ pub async fn connect_to_peer(
                     let Ok(msg) = serde_json::from_str::<TcpMessage>(trimmed) else {
                         continue;
                     };
-                    match msg {
-                        TcpMessage::DirectMessage {
-                            ref id,
-                            ref from_id,
-                            ref from_name,
-                            ref content,
-                            ref timestamp,
-                        } => {
-                            let row = MessageRow {
-                                id: id.clone(),
-                                conversation_id: from_id.clone(),
-                                from_id: from_id.clone(),
-                                from_name: from_name.clone(),
-                                content: content.clone(),
-                                timestamp: timestamp.clone(),
-                                is_group: false,
-                                status: "delivered".into(),
-                            };
-                            {
-                                let d = db.lock().await;
-                                let _ = d.insert_message(&row);
-                            }
-                            let js = js_call("incoming_message", &row);
-                            let _ = proxy.send_event(AppEvent::EvalScript(js));
-                        }
-                        TcpMessage::GroupMessage {
-                            ref id,
-                            ref group_id,
-                            ref from_id,
-                            ref from_name,
-                            ref content,
-                            ref timestamp,
-                        } => {
-                            let row = MessageRow {
-                                id: id.clone(),
-                                conversation_id: group_id.clone(),
-                                from_id: from_id.clone(),
-                                from_name: from_name.clone(),
-                                content: content.clone(),
-                                timestamp: timestamp.clone(),
-                                is_group: true,
-                                status: "delivered".into(),
-                            };
-                            {
-                                let d = db.lock().await;
-                                let _ = d.insert_message(&row);
-                            }
-                            let js = js_call("incoming_message", &row);
-                            let _ = proxy.send_event(AppEvent::EvalScript(js));
-                        }
-                        TcpMessage::Ack {
-                            ref message_id,
-                            ref status,
-                        } => {
-                            {
-                                let d = db.lock().await;
-                                let _ = d.update_message_status(message_id, status);
-                            }
-                            #[derive(serde::Serialize)]
-                            struct AckInfo {
-                                message_id: String,
-                                status: String,
-                            }
-                            let js = js_call(
-                                "message_ack",
-                                &AckInfo {
-                                    message_id: message_id.clone(),
-                                    status: status.clone(),
-                                },
-                            );
-                            let _ = proxy.send_event(AppEvent::EvalScript(js));
-                        }
-                        TcpMessage::GroupCreate {
-                            ref group_id,
-                            ref name,
-                            ref creator_id,
-                            ref members,
-                        } => {
-                            let d = db.lock().await;
-                            let _ = d.create_group(group_id, name, creator_id);
-                            for m in members {
-                                let _ = d.add_group_member(group_id, m);
-                            }
-                            let groups = d.get_groups();
-                            drop(d);
-                            let js = js_call("group_list", &groups);
-                            let _ = proxy.send_event(AppEvent::EvalScript(js));
-                        }
-                        _ => {}
-                    }
+                    process_incoming(&msg, &wr_clone, &db, &proxy).await;
                 }
             }
         }
-        // Connection closed
-        let mut conns = st.connections.lock().await;
-        conns.remove(&rpid);
+        // Connection closed — remove only if it's still OUR writer
+        {
+            let mut conns = st.connections.lock().await;
+            if let Some(existing) = conns.get(&rpid) {
+                if Arc::ptr_eq(existing, &wr_clone) {
+                    conns.remove(&rpid);
+                }
+            }
+        }
     });
 
-    Some(())
+    Ok(())
 }
 
-/// Send a TCP message to a specific peer. Ensures connection exists first.
+/// Send a TCP message to a specific peer.
+/// Returns Err if not connected or write fails.
 pub async fn send_to_peer(
     peer_id: &str,
     msg: &TcpMessage,
     state: &SharedState,
 ) -> Result<(), String> {
-    let mut conns = state.connections.lock().await;
-    let writer = conns
-        .get_mut(peer_id)
-        .ok_or_else(|| "Not connected to peer".to_string())?;
+    let writer = {
+        let conns = state.connections.lock().await;
+        conns
+            .get(peer_id)
+            .cloned()
+            .ok_or_else(|| "Not connected to peer".to_string())?
+    };
 
     let mut data = serde_json::to_string(msg).map_err(|e| e.to_string())?;
     data.push('\n');
-    writer
-        .write_all(data.as_bytes())
+
+    let mut w = writer.lock().await;
+    w.write_all(data.as_bytes())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Write failed: {e}"))?;
+    w.flush()
+        .await
+        .map_err(|e| format!("Flush failed: {e}"))?;
     Ok(())
+}
+
+/// Remove a dead connection from state so reconnect can happen.
+pub async fn remove_connection(peer_id: &str, state: &SharedState) {
+    let mut conns = state.connections.lock().await;
+    conns.remove(peer_id);
+}
+
+// ── Shared message processing ──────────────────────────────────────
+
+async fn process_incoming(
+    msg: &TcpMessage,
+    writer: &SharedWriter,
+    db: &TokioMutex<Database>,
+    proxy: &EventLoopProxy<AppEvent>,
+) {
+    match msg {
+        TcpMessage::DirectMessage {
+            id,
+            from_id,
+            from_name,
+            content,
+            timestamp,
+        } => {
+            let row = MessageRow {
+                id: id.clone(),
+                conversation_id: from_id.clone(),
+                from_id: from_id.clone(),
+                from_name: from_name.clone(),
+                content: content.clone(),
+                timestamp: timestamp.clone(),
+                is_group: false,
+                status: "delivered".into(),
+            };
+            {
+                let d = db.lock().await;
+                let _ = d.insert_message(&row);
+            }
+            let js = js_call("incoming_message", &row);
+            let _ = proxy.send_event(AppEvent::EvalScript(js));
+            let _ = proxy.send_event(AppEvent::RequestAttention);
+            send_ack(writer, id).await;
+        }
+        TcpMessage::GroupMessage {
+            id,
+            group_id,
+            from_id,
+            from_name,
+            content,
+            timestamp,
+        } => {
+            let row = MessageRow {
+                id: id.clone(),
+                conversation_id: group_id.clone(),
+                from_id: from_id.clone(),
+                from_name: from_name.clone(),
+                content: content.clone(),
+                timestamp: timestamp.clone(),
+                is_group: true,
+                status: "delivered".into(),
+            };
+            {
+                let d = db.lock().await;
+                let _ = d.insert_message(&row);
+            }
+            let js = js_call("incoming_message", &row);
+            let _ = proxy.send_event(AppEvent::EvalScript(js));
+            let _ = proxy.send_event(AppEvent::RequestAttention);
+            send_ack(writer, id).await;
+        }
+        TcpMessage::Ack {
+            message_id,
+            status,
+        } => {
+            {
+                let d = db.lock().await;
+                let _ = d.update_message_status(message_id, status);
+            }
+            #[derive(serde::Serialize)]
+            struct AckInfo<'a> {
+                message_id: &'a str,
+                status: &'a str,
+            }
+            let js = js_call(
+                "message_ack",
+                &AckInfo {
+                    message_id,
+                    status,
+                },
+            );
+            let _ = proxy.send_event(AppEvent::EvalScript(js));
+        }
+        TcpMessage::GroupCreate {
+            group_id,
+            name,
+            creator_id,
+            members,
+        } => {
+            let d = db.lock().await;
+            let _ = d.create_group(group_id, name, creator_id);
+            for m in members {
+                let _ = d.add_group_member(group_id, m);
+            }
+            let groups = d.get_groups();
+            drop(d);
+            let js = js_call("group_list", &groups);
+            let _ = proxy.send_event(AppEvent::EvalScript(js));
+        }
+        TcpMessage::GroupMemberAdd { group_id, peer_id } => {
+            let d = db.lock().await;
+            let _ = d.add_group_member(group_id, peer_id);
+        }
+        TcpMessage::GroupMemberRemove { group_id, peer_id } => {
+            let d = db.lock().await;
+            let _ = d.remove_group_member(group_id, peer_id);
+        }
+        TcpMessage::Hello { .. } => {}
+    }
+}
+
+async fn send_ack(writer: &SharedWriter, message_id: &str) {
+    let ack = TcpMessage::Ack {
+        message_id: message_id.to_string(),
+        status: "delivered".into(),
+    };
+    let mut ack_json = serde_json::to_string(&ack).unwrap();
+    ack_json.push('\n');
+    let mut w = writer.lock().await;
+    let _ = w.write_all(ack_json.as_bytes()).await;
+    let _ = w.flush().await;
 }

@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Commands coming from the JS frontend via `window.ipc.postMessage(json)`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum IpcCommand {
@@ -20,9 +19,10 @@ pub enum IpcCommand {
     GetGroups,
     #[serde(rename = "mark_read")]
     MarkRead { conversation_id: String },
+    #[serde(rename = "set_always_on_top")]
+    SetAlwaysOnTop { enabled: bool },
 }
 
-/// Builds JS eval strings for sending data from Rust into the WebView.
 pub fn js_call(event: &str, data: &impl Serialize) -> String {
     let json = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
     format!(

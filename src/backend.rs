@@ -13,8 +13,6 @@ use tokio::sync::Mutex as TokioMutex;
 
 const TCP_PORT: u16 = 9999;
 
-/// Spawns the tokio runtime on a background thread.
-/// Returns an mpsc::Sender for IPC commands from the WebView.
 pub fn start(proxy: EventLoopProxy<AppEvent>) -> mpsc::UnboundedSender<String> {
     let (tx, rx) = mpsc::unbounded_channel::<String>();
 
@@ -28,12 +26,75 @@ pub fn start(proxy: EventLoopProxy<AppEvent>) -> mpsc::UnboundedSender<String> {
     tx
 }
 
+/// Try to connect to a peer if not already connected.
+async fn ensure_connected(
+    target_peer_id: &str,
+    my_peer_id: &str,
+    my_username: &str,
+    state: &Arc<SharedState>,
+    db: &Arc<TokioMutex<Database>>,
+    proxy: &EventLoopProxy<AppEvent>,
+) {
+    {
+        let conns = state.connections.lock().await;
+        if conns.contains_key(target_peer_id) {
+            return;
+        }
+    }
+
+    let (ip, port) = {
+        let peers = state.peers.lock().await;
+        match peers.get(target_peer_id) {
+            Some(p) => (p.ip.clone(), p.tcp_port),
+            None => return,
+        }
+    };
+
+    if let Err(e) = network::connect_to_peer(
+        &ip,
+        port,
+        my_peer_id,
+        my_username,
+        state.clone(),
+        db.clone(),
+        proxy.clone(),
+    )
+    .await
+    {
+        eprintln!("Connect to peer failed: {e}");
+    }
+}
+
+/// Send message to peer with retry: if first send fails, drop dead connection,
+/// reconnect, and try once more.
+async fn send_with_retry(
+    target_peer_id: &str,
+    msg: &TcpMessage,
+    my_peer_id: &str,
+    my_username: &str,
+    state: &Arc<SharedState>,
+    db: &Arc<TokioMutex<Database>>,
+    proxy: &EventLoopProxy<AppEvent>,
+) -> Result<(), String> {
+    // First attempt
+    ensure_connected(target_peer_id, my_peer_id, my_username, state, db, proxy).await;
+    match network::send_to_peer(target_peer_id, msg, state).await {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            eprintln!("Send failed (will retry): {e}");
+        }
+    }
+
+    // Remove dead connection and retry
+    network::remove_connection(target_peer_id, state).await;
+    ensure_connected(target_peer_id, my_peer_id, my_username, state, db, proxy).await;
+    network::send_to_peer(target_peer_id, msg, state).await
+}
+
 async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppEvent>) {
-    // Open database
     let db = Database::open().expect("Failed to open database");
     let db = Arc::new(TokioMutex::new(db));
 
-    // Load or create peer_id
     let (peer_id, username) = {
         let d = db.lock().await;
         let peer_id = match d.get_config("peer_id") {
@@ -48,7 +109,6 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
         (peer_id, username)
     };
 
-    // Send config to UI
     #[derive(serde::Serialize)]
     struct ConfigInfo {
         peer_id: String,
@@ -63,10 +123,8 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
     );
     let _ = proxy.send_event(AppEvent::EvalScript(js));
 
-    // Create shared state
     let state = SharedState::new();
 
-    // If we already have a username, start networking
     let networking_started = Arc::new(TokioMutex::new(username.is_some()));
     if username.is_some() {
         start_networking(
@@ -77,7 +135,6 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
             proxy.clone(),
         )
         .await;
-        // Also send groups
         let d = db.lock().await;
         let groups = d.get_groups();
         drop(d);
@@ -85,7 +142,6 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
         let _ = proxy.send_event(AppEvent::EvalScript(js));
     }
 
-    // Process IPC commands
     while let Some(raw) = rx.recv().await {
         let cmd: IpcCommand = match serde_json::from_str(&raw) {
             Ok(c) => c,
@@ -102,7 +158,6 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                     let d = db.lock().await;
                     d.set_config("username", &username).unwrap();
                 }
-                // Start networking if not started
                 let mut started = networking_started.lock().await;
                 if !*started {
                     start_networking(
@@ -115,11 +170,6 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                     .await;
                     *started = true;
                 }
-                #[derive(serde::Serialize)]
-                struct ConfigInfo {
-                    peer_id: String,
-                    username: Option<String>,
-                }
                 let js = js_call(
                     "config_loaded",
                     &ConfigInfo {
@@ -129,74 +179,58 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                 );
                 let _ = proxy.send_event(AppEvent::EvalScript(js));
             }
-            IpcCommand::SendMessage { peer_id: target_id, content } => {
+
+            IpcCommand::SendMessage {
+                peer_id: target_id,
+                content,
+            } => {
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 let msg_id = uuid::Uuid::new_v4().to_string();
 
-                // Get our username
                 let uname = {
                     let d = db.lock().await;
                     d.get_config("username").unwrap_or_default()
                 };
 
-                // Save to DB
-                let row = MessageRow {
+                let tcp_msg = TcpMessage::DirectMessage {
                     id: msg_id.clone(),
-                    conversation_id: target_id.clone(),
                     from_id: peer_id.clone(),
                     from_name: uname.clone(),
                     content: content.clone(),
                     timestamp: timestamp.clone(),
+                };
+
+                let status = match send_with_retry(
+                    &target_id, &tcp_msg, &peer_id, &uname, &state, &db, &proxy,
+                )
+                .await
+                {
+                    Ok(_) => "sent",
+                    Err(e) => {
+                        let js = js_call("error", &format!("Envio falhou: {e}"));
+                        let _ = proxy.send_event(AppEvent::EvalScript(js));
+                        "failed"
+                    }
+                };
+
+                let row = MessageRow {
+                    id: msg_id,
+                    conversation_id: target_id,
+                    from_id: peer_id.clone(),
+                    from_name: uname,
+                    content,
+                    timestamp,
                     is_group: false,
-                    status: "sent".into(),
+                    status: status.into(),
                 };
                 {
                     let d = db.lock().await;
                     let _ = d.insert_message(&row);
                 }
-
-                // Ensure connection exists
-                {
-                    let conns = state.connections.lock().await;
-                    if !conns.contains_key(&target_id) {
-                        drop(conns);
-                        // Try to connect
-                        let peers = state.peers.lock().await;
-                        if let Some(peer_info) = peers.get(&target_id) {
-                            let ip = peer_info.ip.clone();
-                            let port = peer_info.tcp_port;
-                            drop(peers);
-                            network::connect_to_peer(
-                                &ip,
-                                port,
-                                &peer_id,
-                                &uname,
-                                state.clone(),
-                                db.clone(),
-                                proxy.clone(),
-                            )
-                            .await;
-                        }
-                    }
-                }
-
-                // Send TCP message
-                let tcp_msg = TcpMessage::DirectMessage {
-                    id: msg_id,
-                    from_id: peer_id.clone(),
-                    from_name: uname,
-                    content,
-                    timestamp,
-                };
-                if let Err(e) = network::send_to_peer(&target_id, &tcp_msg, &state).await {
-                    let js = js_call("error", &format!("Send failed: {e}"));
-                    let _ = proxy.send_event(AppEvent::EvalScript(js));
-                }
-
-                // Push our own message to UI
                 let js = js_call("incoming_message", &row);
                 let _ = proxy.send_event(AppEvent::EvalScript(js));
             }
+
             IpcCommand::SendGroupMessage { group_id, content } => {
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 let msg_id = uuid::Uuid::new_v4().to_string();
@@ -206,14 +240,40 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                     d.get_config("username").unwrap_or_default()
                 };
 
-                // Save to DB
-                let row = MessageRow {
+                let members = {
+                    let d = db.lock().await;
+                    d.get_group_members(&group_id)
+                };
+
+                let tcp_msg = TcpMessage::GroupMessage {
                     id: msg_id.clone(),
-                    conversation_id: group_id.clone(),
+                    group_id: group_id.clone(),
                     from_id: peer_id.clone(),
                     from_name: uname.clone(),
                     content: content.clone(),
                     timestamp: timestamp.clone(),
+                };
+
+                for member_id in &members {
+                    if member_id == &peer_id {
+                        continue;
+                    }
+                    if let Err(e) = send_with_retry(
+                        member_id, &tcp_msg, &peer_id, &uname, &state, &db, &proxy,
+                    )
+                    .await
+                    {
+                        eprintln!("Group send to {member_id}: {e}");
+                    }
+                }
+
+                let row = MessageRow {
+                    id: msg_id,
+                    conversation_id: group_id,
+                    from_id: peer_id.clone(),
+                    from_name: uname,
+                    content,
+                    timestamp,
                     is_group: true,
                     status: "sent".into(),
                 };
@@ -221,56 +281,10 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                     let d = db.lock().await;
                     let _ = d.insert_message(&row);
                 }
-
-                // Get group members
-                let members = {
-                    let d = db.lock().await;
-                    d.get_group_members(&group_id)
-                };
-
-                // Fan-out to all members
-                let tcp_msg = TcpMessage::GroupMessage {
-                    id: msg_id,
-                    group_id: group_id.clone(),
-                    from_id: peer_id.clone(),
-                    from_name: uname.clone(),
-                    content,
-                    timestamp,
-                };
-                for member_id in &members {
-                    if member_id == &peer_id {
-                        continue;
-                    }
-                    // Ensure connection
-                    {
-                        let conns = state.connections.lock().await;
-                        if !conns.contains_key(member_id) {
-                            drop(conns);
-                            let peers = state.peers.lock().await;
-                            if let Some(pi) = peers.get(member_id) {
-                                let ip = pi.ip.clone();
-                                let port = pi.tcp_port;
-                                drop(peers);
-                                network::connect_to_peer(
-                                    &ip,
-                                    port,
-                                    &peer_id,
-                                    &uname,
-                                    state.clone(),
-                                    db.clone(),
-                                    proxy.clone(),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    let _ = network::send_to_peer(member_id, &tcp_msg, &state).await;
-                }
-
-                // Push own message to UI
                 let js = js_call("incoming_message", &row);
                 let _ = proxy.send_event(AppEvent::EvalScript(js));
             }
+
             IpcCommand::LoadHistory { conversation_id } => {
                 let messages = {
                     let d = db.lock().await;
@@ -279,12 +293,12 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                 let js = js_call("history", &messages);
                 let _ = proxy.send_event(AppEvent::EvalScript(js));
             }
+
             IpcCommand::CreateGroup { name, members } => {
                 let group_id = uuid::Uuid::new_v4().to_string();
                 {
                     let d = db.lock().await;
                     let _ = d.create_group(&group_id, &name, &peer_id);
-                    // Add ourselves
                     let _ = d.add_group_member(&group_id, &peer_id);
                     for m in &members {
                         let _ = d.add_group_member(&group_id, m);
@@ -296,7 +310,6 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                     d.get_config("username").unwrap_or_default()
                 };
 
-                // Notify all members via TCP
                 let mut all_members = members.clone();
                 all_members.push(peer_id.clone());
                 let tcp_msg = TcpMessage::GroupCreate {
@@ -306,33 +319,12 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                     members: all_members,
                 };
                 for member_id in &members {
-                    // Ensure connection
-                    {
-                        let conns = state.connections.lock().await;
-                        if !conns.contains_key(member_id) {
-                            drop(conns);
-                            let peers = state.peers.lock().await;
-                            if let Some(pi) = peers.get(member_id) {
-                                let ip = pi.ip.clone();
-                                let port = pi.tcp_port;
-                                drop(peers);
-                                network::connect_to_peer(
-                                    &ip,
-                                    port,
-                                    &peer_id,
-                                    &uname,
-                                    state.clone(),
-                                    db.clone(),
-                                    proxy.clone(),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    let _ = network::send_to_peer(member_id, &tcp_msg, &state).await;
+                    let _ = send_with_retry(
+                        member_id, &tcp_msg, &peer_id, &uname, &state, &db, &proxy,
+                    )
+                    .await;
                 }
 
-                // Refresh groups in UI
                 let d = db.lock().await;
                 let groups = d.get_groups();
                 drop(d);
@@ -342,9 +334,11 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                 let js = js_call("group_created", &group_id);
                 let _ = proxy.send_event(AppEvent::EvalScript(js));
             }
+
             IpcCommand::GetPeers => {
                 discovery::send_peer_list(&state, &proxy).await;
             }
+
             IpcCommand::GetGroups => {
                 let d = db.lock().await;
                 let groups = d.get_groups();
@@ -352,8 +346,11 @@ async fn run(mut rx: mpsc::UnboundedReceiver<String>, proxy: EventLoopProxy<AppE
                 let js = js_call("group_list", &groups);
                 let _ = proxy.send_event(AppEvent::EvalScript(js));
             }
-            IpcCommand::MarkRead { conversation_id: _ } => {
-                // Could update unread counts in DB — for now, handled client-side
+
+            IpcCommand::MarkRead { .. } => {}
+
+            IpcCommand::SetAlwaysOnTop { enabled } => {
+                let _ = proxy.send_event(AppEvent::SetAlwaysOnTop(enabled));
             }
         }
     }
@@ -366,7 +363,6 @@ async fn start_networking(
     db: Arc<TokioMutex<Database>>,
     proxy: EventLoopProxy<AppEvent>,
 ) {
-    // Start TCP listener
     let pid = peer_id.clone();
     let uname = username.clone();
     let st = state.clone();
@@ -376,7 +372,6 @@ async fn start_networking(
         network::run_listener(pid, uname, st, d, px).await;
     });
 
-    // Start UDP discovery
     let pid = peer_id.clone();
     let uname = username.clone();
     let st = state.clone();
